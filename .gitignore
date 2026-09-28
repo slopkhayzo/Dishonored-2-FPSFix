@@ -1,0 +1,10 @@
+/build/
+/dist/
+*.dll
+*.exe
+*.exp
+*.lib
+*.obj
+*.log
+*.pdb
+*.sha256
