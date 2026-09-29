@@ -11,7 +11,7 @@
 
 A source-only high-frame-rate fix for the GOG release of Dishonored 2. It keeps the game's simulation and physics at their native 120 Hz while smoothing presentation above 120 FPS by interpolating all world assets, player included, alongside skeletal animations to match the display framerate, with an additional per-frame mouse delta override to keep mouse input latency low.
 
-Current release: **v1.0.0**
+Current release: **v1.1.0**
 
 ## Compatibility
 
@@ -21,7 +21,7 @@ This patch supports one executable only:
 - `Dishonored2.exe` SHA-256: `C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293`
 - Windows x64
 
-The DLL verifies the full executable hash and the original hook bytes before installing any hook. Other game versions and storefront builds fail closed and are not modified.
+The ASI plugin verifies the full executable hash and the original hook bytes before installing any hook. Other game versions and storefront builds fail closed and are not modified.
 
 ## What it fixes
 
@@ -35,7 +35,7 @@ The patch does not raise the simulation rate or modify authoritative physics, AI
 
 ## Current status
 
-Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The validated presentation layers are enabled by default in v1.0.0 and can still be disabled independently.
+Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The validated presentation layers are enabled by default in v1.1.0 and can still be disabled independently.
 
 Two areas are deliberately unsupported:
 
@@ -50,28 +50,74 @@ Install Visual Studio 2022 or the current Visual Studio Build Tools with the **D
 build-msvc.cmd
 ```
 
-The script locates the x64 MSVC toolchain, builds `build\dinput8.dll`, builds the forwarding smoke test, and builds and runs the joint-pose interpolation tests. No game files are needed to compile the source.
+The script locates the x64 MSVC toolchain, builds
+`build\Dishonored2HighFPSFix.asi`, builds and runs the direct ASI load test,
+builds the external-loader integration host, and builds and runs the joint-pose
+interpolation tests. No game files are needed to compile or test the source.
 
-To run the proxy forwarding test manually:
+To run the ASI load test manually:
 
 ```bat
-build\proxy-smoke-test.exe build\dinput8.dll
+build\asi-load-test.exe build\Dishonored2HighFPSFix.asi
 ```
 
-The test host is not the supported game executable, so the proxy will load and forward `DirectInput8Create` while correctly refusing to install game hooks.
+The test loads the `.asi` directly into an unsupported host and verifies that
+it has no DirectInput proxy export, resolves its sibling log path, and refuses
+to install game hooks. It does not replace in-game testing through the selected
+ASI loader.
+
+To test discovery and forwarding through an external loader without modifying
+the game installation, build first and then provide the path to an x64 loader:
+
+```powershell
+.\test-asi-loader.ps1 -LoaderPath C:\path\to\dinput8.dll
+```
+
+The script creates a disposable staging directory below `build`, runs the
+integration host, and verifies loader discovery, system DirectInput forwarding,
+plugin loading, sibling logging, and safe unsupported-host rejection. The
+official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.1.0
+in-game feature-parity validation.
+
+## Package
+
+After building and validating the plugin, create the canonical plugin-only
+archive and the optional tested-loader convenience archive with:
+
+```powershell
+.\package-release.ps1 -Version 1.1.0 `
+  -LoaderPath .\build\third-party\ultimate-asi-loader-v9.7.4\extracted\dinput8.dll
+```
+
+The packaging script pins the expected loader hash, generates per-file and ZIP
+SHA-256 manifests, includes the required third-party notice only in the loader
+bundle, and refuses to overwrite an existing release archive. Omit
+`-LoaderPath` to produce only the plugin-only archive.
 
 ## Install
 
 1. Close Dishonored 2.
 2. Build the project.
-3. Copy `build\dinput8.dll` and `d2-high-fps-fix.ini` beside `Dishonored2.exe`.
-4. Keep **Triple Buffering** disabled in the game.
-5. Set the desired maximum frame rate in the NVIDIA Control Panel or another external limiter. Do not run completely uncapped.
-6. Launch the game normally.
+3. Install a compatible x64 ASI loader, such as Ultimate ASI Loader, according
+   to that loader's documentation. If the game already has a compatible
+   loader, keep it.
+4. Copy `build\Dishonored2HighFPSFix.asi` and `d2-high-fps-fix.ini` beside
+   `Dishonored2.exe`, or into the plugin directory configured for the loader.
+   Keep the ASI and INI together.
+5. Keep **Triple Buffering** disabled in the game.
+6. Set the desired maximum frame rate in the NVIDIA Control Panel or another external limiter. Do not run completely uncapped.
+7. Launch the game normally.
 
-Do not overwrite another mod's `dinput8.dll`. Proxy DLLs cannot simply be stacked; use only one compatible loader arrangement.
+The canonical release is plugin-only. A separately named convenience archive
+also bundles the tested Ultimate ASI Loader v9.7.4 x64 build. When using that
+archive on a game with no loader, copy its `dinput8.dll` too. If the game
+already has a compatible loader, do not overwrite it; copy only the ASI and
+INI. [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
+is MIT-licensed, and the convenience archive includes its required notice.
 
-The patch writes `d2-high-fps-fix.log` beside the DLL. If the executable hash or guarded bytes do not match, the log explains why the hooks were not installed.
+The patch writes `d2-high-fps-fix.log` beside the ASI. If the executable hash
+or guarded bytes do not match, the log explains why the hooks were not
+installed.
 
 ## Configuration
 
@@ -106,12 +152,24 @@ Leave these settings unchanged:
 
 Close the game and remove these files from the game directory:
 
-- `dinput8.dll`
+- `Dishonored2HighFPSFix.asi`
 - `d2-high-fps-fix.ini`
 - `d2-high-fps-fix.log` (optional diagnostic log)
 
+Do not remove a shared or pre-existing ASI loader when uninstalling this
+plugin.
+
 ## Technical outline
 
-The patch is a `dinput8.dll` proxy that forwards `DirectInput8Create` to the Windows system DLL. On the supported executable it installs guarded renderer hooks, retains recent fixed-step samples, and evaluates temporary camera, model-matrix, or joint-palette data at presentation time. All optional layers are bounded and fail closed when their expected layout, identity, timing, or continuity checks do not pass.
+The patch is an x64 ASI plugin loaded by an external ASI loader. On the
+supported executable it installs guarded renderer hooks, retains recent
+fixed-step samples, and evaluates temporary camera, model-matrix, or
+joint-palette data at presentation time. It does not export or forward
+`DirectInput8Create`. All optional layers are bounded and fail closed when
+their expected layout, identity, timing, or continuity checks do not pass.
 
-The repository intentionally contains source code and build instructions only. It does not include Dishonored 2 executables, assets, extracted data, reverse-engineering databases, captures, logs, or research notes.
+The repository contains the patch source and build/package instructions. Release
+archives contain only the built plugin, configuration, documentation, hashes,
+and—only in the explicitly named convenience archive—the third-party ASI
+loader and its required notice. No Dishonored 2 executable or game asset is
+distributed.

@@ -24,10 +24,9 @@ if errorlevel 1 (
 if not exist "build" mkdir "build"
 
 cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /LD /DUNICODE /D_UNICODE ^
-  /Fo:"build\\" ^
-  "dinput8_proxy.cpp" ^
-  /link /DEF:"dinput8_proxy.def" /OUT:"build\dinput8.dll" ^
-  /IMPLIB:"build\dinput8_proxy.lib" bcrypt.lib user32.lib
+  /Fo:"build\d2-high-fps-fix.obj" ^
+  "d2_high_fps_fix.cpp" ^
+  /link /OUT:"build\Dishonored2HighFPSFix.asi" bcrypt.lib user32.lib
 
 if errorlevel 1 (
   echo.
@@ -36,13 +35,24 @@ if errorlevel 1 (
 )
 
 cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
-  /Fo:"build\\proxy-smoke-test.obj" ^
-  "proxy-smoke-test.cpp" ^
-  /link /OUT:"build\proxy-smoke-test.exe" dinput8.lib dxguid.lib
+  /Fo:"build\asi-load-test.obj" ^
+  "asi-load-test.cpp" ^
+  /link /OUT:"build\asi-load-test.exe"
 
 if errorlevel 1 (
   echo.
-  echo Smoke-test build failed.
+  echo ASI load-test build failed.
+  exit /b 1
+)
+
+cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
+  /Fo:"build\asi-loader-test.obj" ^
+  "asi-loader-test.cpp" ^
+  /link /OUT:"build\asi-loader-test.exe" dinput8.lib dxguid.lib
+
+if errorlevel 1 (
+  echo.
+  echo External ASI loader integration-test build failed.
   exit /b 1
 )
 
@@ -64,8 +74,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+"build\asi-load-test.exe" "build\Dishonored2HighFPSFix.asi"
+if errorlevel 1 (
+  echo.
+  echo ASI load test failed.
+  exit /b 1
+)
+
 echo.
-echo Built: %CD%\build\dinput8.dll
-echo Built: %CD%\build\proxy-smoke-test.exe
+echo Built and load-tested: %CD%\build\Dishonored2HighFPSFix.asi
+echo Built: %CD%\build\asi-load-test.exe
+echo Built: %CD%\build\asi-loader-test.exe
 echo Built and passed: %CD%\build\joint-pose-test.exe
 endlocal

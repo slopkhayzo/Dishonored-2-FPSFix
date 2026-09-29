@@ -2,7 +2,6 @@
 #define NOMINMAX
 #include <windows.h>
 #include <bcrypt.h>
-#include <unknwn.h>
 
 #include <algorithm>
 #include <array>
@@ -133,15 +132,14 @@ constexpr double kMinimumAlpha = -0.25;
 constexpr double kMaximumAlpha = 2.0;
 constexpr double kPi = 3.14159265358979323846;
 
-HMODULE g_proxyModule = nullptr;
-HMODULE g_realDinput8 = nullptr;
-INIT_ONCE g_realDinputOnce = INIT_ONCE_STATIC_INIT;
+HMODULE g_pluginModule = nullptr;
 std::uintptr_t g_executableBase = 0;
 void* g_relay = nullptr;
 std::array<void*, 2> g_shadowCasterBuildTrampolines{};
 void* g_renderModelGpuCopyTrampoline = nullptr;
 void* g_skinnedPoseUploadTrampoline = nullptr;
 std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_initializationStarted{false};
 bool g_f10WasDown = false;
 HANDLE g_telemetryMapping = nullptr;
 bool g_unlockAbove120 = false;
@@ -233,9 +231,6 @@ struct SharedTelemetry {
 static_assert(sizeof(SharedTelemetry) == 144, "Unexpected telemetry layout");
 SharedTelemetry* g_telemetry = nullptr;
 double g_lastAlpha = std::numeric_limits<double>::quiet_NaN();
-
-using DirectInput8CreateFn = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-DirectInput8CreateFn g_realDirectInput8Create = nullptr;
 
 using CopyViewFn = void*(__fastcall*)(void*, const void*);
 CopyViewFn g_originalCopyView = nullptr;
@@ -532,7 +527,7 @@ struct SkeletalPreparedUpload {
 
 void BuildSiblingPath(wchar_t* output, std::size_t capacity, const wchar_t* filename) {
     output[0] = L'\0';
-    GetModuleFileNameW(g_proxyModule, output, static_cast<DWORD>(capacity));
+    GetModuleFileNameW(g_pluginModule, output, static_cast<DWORD>(capacity));
     wchar_t* slash = wcsrchr(output, L'\\');
     if (slash != nullptr) {
         slash[1] = L'\0';
@@ -600,21 +595,6 @@ void LoadConfiguration() {
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U,
         g_enableTelemetry ? 1U : 0U);
-}
-
-BOOL CALLBACK LoadRealDinput8(PINIT_ONCE, PVOID, PVOID*) {
-    wchar_t systemDirectory[MAX_PATH]{};
-    if (GetSystemDirectoryW(systemDirectory, MAX_PATH) == 0) {
-        return FALSE;
-    }
-    wcscat_s(systemDirectory, MAX_PATH, L"\\dinput8.dll");
-    g_realDinput8 = LoadLibraryW(systemDirectory);
-    if (g_realDinput8 == nullptr) {
-        return FALSE;
-    }
-    g_realDirectInput8Create = reinterpret_cast<DirectInput8CreateFn>(
-        GetProcAddress(g_realDinput8, "DirectInput8Create"));
-    return g_realDirectInput8Create != nullptr;
 }
 
 bool ComputeFileSha256(const wchar_t* path, unsigned char output[32]) {
@@ -4510,23 +4490,15 @@ DWORD WINAPI InstallThread(void*) {
 
 }  // namespace
 
-extern "C" __declspec(dllexport) HRESULT WINAPI DirectInput8Create(
-    HINSTANCE instance, DWORD version, REFIID interfaceId, LPVOID* output,
-    LPUNKNOWN outerUnknown) {
-    if (!InitOnceExecuteOnce(&g_realDinputOnce, LoadRealDinput8, nullptr, nullptr) ||
-        g_realDirectInput8Create == nullptr) {
-        return E_FAIL;
-    }
-    return g_realDirectInput8Create(instance, version, interfaceId, output, outerUnknown);
-}
-
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        g_proxyModule = module;
+        g_pluginModule = module;
         DisableThreadLibraryCalls(module);
-        HANDLE thread = CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr);
-        if (thread != nullptr) {
-            CloseHandle(thread);
+        if (!g_initializationStarted.exchange(true, std::memory_order_acq_rel)) {
+            HANDLE thread = CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr);
+            if (thread != nullptr) {
+                CloseHandle(thread);
+            }
         }
     }
     return TRUE;
