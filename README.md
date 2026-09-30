@@ -7,7 +7,7 @@
 > briefly tested at 120, 144 and 240 and so far spotted 
 > no major issues (on my machine ofc, if you have issues feel free to open an Issue)
 > this patch currently probably only works for the latest GOG version of the game, I do have 
-> the Steam version too but still have to test that, so no guarantees for now
+> the Steam version too but still have to test that, so no guarantees for now.
 > If you're interested and want more (human generated) info, I have a blog post [here](https://slop-blog.enkhayzomachines.net/posts/dishonored-2-high-fps-fix) :)
 
 A source-only high-frame-rate fix for the GOG release of Dishonored 2. It keeps the game's simulation and physics at their native 120 Hz while smoothing presentation above 120 FPS by interpolating all world assets, player included, alongside skeletal animations to match the display framerate, with an additional per-frame mouse delta override to keep mouse input latency low.
