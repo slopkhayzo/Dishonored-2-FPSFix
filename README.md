@@ -12,17 +12,27 @@
 
 A source-only high-frame-rate fix for the GOG release of Dishonored 2. It keeps the game's simulation and physics at their native 120 Hz while smoothing presentation above 120 FPS by interpolating all world assets, player included, alongside skeletal animations to match the display framerate, with an additional per-frame mouse delta override to keep mouse input latency low.
 
-Current release: **v1.1.0**
+Current release: **v1.3.0**
 
 ## Compatibility
 
-This patch supports one executable only:
+The fully tested reference executable is:
 
 - Dishonored 2 GOG, version 1.77.9.0
 - `Dishonored2.exe` SHA-256: `C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293`
 - Windows x64
 
-The ASI plugin verifies the full executable hash and the original hook bytes before installing any hook. Other game versions and storefront builds fail closed and are not modified.
+The SHA-256 is now an identity diagnostic rather than a hard allowlist. Before
+installing any hook, the ASI verifies that the host is a PE32+ x64
+`Dishonored2.exe`, that every required RVA has the expected code/data section
+permissions, that the renderer-view call, deep-copy target signature, and
+relevant vtables still point to the expected functions, and that every enabled
+hook has its original byte signature. An executable with a different SHA can
+therefore activate when it retains the complete verified runtime layout.
+Builds that relocate or change
+any required path fail closed and need a separately researched layout profile.
+Only the GOG build above has received full live testing; layout-compatible
+acceptance is not a gameplay-support claim for other releases.
 
 ## What it fixes
 
@@ -36,7 +46,7 @@ The patch does not raise the simulation rate or modify authoritative physics, AI
 
 ## Current status
 
-Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The validated presentation layers are enabled by default in v1.1.0 and can still be disabled independently.
+Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The validated presentation layers remain enabled by default and can still be disabled independently.
 
 Two areas are deliberately unsupported:
 
@@ -77,7 +87,7 @@ the game installation, build first and then provide the path to an x64 loader:
 The script creates a disposable staging directory below `build`, runs the
 integration host, and verifies loader discovery, system DirectInput forwarding,
 plugin loading, sibling logging, and safe unsupported-host rejection. The
-official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.1.0
+official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.3.0
 in-game feature-parity validation.
 
 ## Package
@@ -86,7 +96,7 @@ After building and validating the plugin, create the canonical plugin-only
 archive and the optional tested-loader convenience archive with:
 
 ```powershell
-.\package-release.ps1 -Version 1.1.0 `
+.\package-release.ps1 -Version 1.3.0 `
   -LoaderPath .\build\third-party\ultimate-asi-loader-v9.7.4\extracted\dinput8.dll
 ```
 
@@ -116,9 +126,9 @@ already has a compatible loader, do not overwrite it; copy only the ASI and
 INI. [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
 is MIT-licensed, and the convenience archive includes its required notice.
 
-The patch writes `d2-high-fps-fix.log` beside the ASI. If the executable hash
-or guarded bytes do not match, the log explains why the hooks were not
-installed.
+The patch writes `d2-high-fps-fix.log` beside the ASI. It records whether the
+reference hash was recognized and explains any executable-layout, call-target,
+vtable, section-permission, or hook-signature failure.
 
 ## Configuration
 
@@ -132,6 +142,25 @@ Edit `d2-high-fps-fix.ini` while the game is closed.
 
 Press **F10** in game to toggle camera prediction and the enabled first-person root correction for an A/B comparison. F10 does not change the FPS limit or the separate interpolation options.
 
+For development performance comparisons, set
+`Diagnostics/InterpolationABProbe=1`. The in-session controls are:
+
+- **Ctrl+F11** starts or stops a clean measurement segment. Stop it while
+  travelling between test locations so those frames are excluded.
+- **F11** toggles all configured world, skeletal, and cinematic interpolation
+  layers. If a segment is active, the old mode is summarized and a new segment
+  starts automatically.
+- **Alt+F11** cycles through **All**, **Transforms only**, **Skeletons only**,
+  and **Off**. This is the preferred control for isolating the two expensive
+  interpolation families in one game session.
+- **Shift+F11** toggles only first-person root stabilization so the shared
+  renderer-model hook can be measured independently.
+
+Every segment discards its first two seconds as warm-up and writes its mode,
+presentation-serial range, average FPS, frame-time percentiles, simulation-tick
+cadence, and interpolation work counters to `d2-high-fps-fix.log`. These keys do
+not change camera prediction, mouse stabilization, or the FPS unlock.
+
 ### Interpolation settings
 
 The following validated layers are enabled by default and can be disabled independently:
@@ -144,10 +173,26 @@ The following validated layers are enabled by default and can be disabled indepe
 
 The supplied configuration enables all five together for the complete validated presentation path. Unsupported models, invalid layouts, discontinuities, teleports, identity changes, and missing history snap to the current native state instead of being blended.
 
+`AdaptivePerformanceGate=1` monitors presentation cadence through the fixed
+120 Hz simulation clock. When full interpolation cannot retain useful native-
+rate headroom, it disables skeletal interpolation first and keeps the cheaper
+transform layer active when practical. If transforms alone remain below the
+guard, it disables them too. Recovery uses the recently measured cost of each
+layer and requires sustained headroom. If the active reduced profile becomes
+materially faster than the scene in which that cost was learned, the gate makes
+one controlled re-probe and relearns the local cost if it fails. This prevents
+a stale expensive-scene estimate as well as a simple on/off cycle around 120
+FPS. Selecting a profile manually with F11 or Alt+F11 suspends the adaptive gate
+until the next launch. This controller is enabled by default. Set
+`AdaptivePerformanceGate=0` to keep every individually enabled interpolation
+layer active continuously, regardless of measured performance.
+
 Leave these settings unchanged:
 
 - `ShadowTransforms=0` — required; the prototype is not safe for normal use.
 - `Telemetry=0` — normal play does not need the development telemetry block.
+
+For ordinary play, keep `InterpolationABProbe=0`.
 
 ## Uninstall
 
@@ -162,8 +207,9 @@ plugin.
 
 ## Technical outline
 
-The patch is an x64 ASI plugin loaded by an external ASI loader. On the
-supported executable it installs guarded renderer hooks, retains recent
+The patch is an x64 ASI plugin loaded by an external ASI loader. On a
+successfully validated executable layout it installs guarded renderer hooks,
+retains recent
 fixed-step samples, and evaluates temporary camera, model-matrix, or
 joint-palette data at presentation time. It does not export or forward
 `DirectInput8Create`. All optional layers are bounded and fail closed when

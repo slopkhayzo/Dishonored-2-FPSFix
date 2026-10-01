@@ -1,15 +1,21 @@
 Dishonored 2 FPS Fix v@VERSION@
 ================================
 
-Supported game
+Validated game
 --------------
-GOG Dishonored 2 version 1.77.9.0 for Windows x64 only.
+GOG Dishonored 2 version 1.77.9.0 for Windows x64.
 
 Dishonored2.exe SHA-256:
 C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293
 
-The ASI plugin verifies this complete hash and the original hook bytes. It
-fails closed without modifying an unsupported executable.
+This hash identifies the fully tested reference build; it is not a hard
+allowlist. Before writing a hook, the ASI validates the x64 PE image layout,
+section permissions, renderer-view call and deep-copy target signatures,
+relevant vtable targets, and every enabled hook signature. A different-hash
+executable is accepted only if that complete runtime layout still matches.
+Relocated or changed layouts fail
+closed and require a separately researched profile. Other builds have not
+received the reference build's live gameplay coverage.
 
 Choose an installation
 ----------------------
@@ -46,6 +52,12 @@ Press F10 in game to toggle camera prediction and first-person root correction
 for an A/B comparison. F10 does not change the FPS limit or the other
 interpolation settings.
 
+The adaptive performance controller is enabled by default. It sheds skeletal
+interpolation first, then transform interpolation, when maintaining those
+layers would leave too little native-120-Hz headroom, and restores them after
+sustained recovery. Set AdaptivePerformanceGate=0 in d2-high-fps-fix.ini to
+keep every individually enabled interpolation layer active continuously.
+
 Removing the game's FPS-dependent mouse multiplier makes the same in-game
 sensitivity feel lower at high FPS. Raise the in-game sensitivity once to your
 preference; it should then remain consistent as the frame rate changes.
@@ -65,7 +77,8 @@ use. Keep Telemetry=0 unless developing the patch.
 Diagnostics
 -----------
 The patch writes d2-high-fps-fix.log beside the ASI. Check it if the fix does
-not activate; executable or hook-byte mismatches are reported there.
+not activate; executable-layout, call-target, vtable, section-permission, and
+hook-signature failures are reported there.
 
 Uninstallation
 --------------

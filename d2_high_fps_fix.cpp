@@ -24,6 +24,9 @@ namespace {
 
 constexpr std::uintptr_t kGamePointerRva = 0x288D608;
 constexpr std::uintptr_t kGameVtableRva = 0x1F02138;
+constexpr std::array<std::uintptr_t, 4> kExpectedGameVtableTargets = {
+    0xA2F190, 0xA3EF00, 0xA3EEF0, 0xA38740,
+};
 constexpr std::uintptr_t kClockOffset = 0x2E7428;
 constexpr std::uintptr_t kScaledTimeOffset = 0x68;
 constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
@@ -34,6 +37,12 @@ constexpr std::uintptr_t kFixMouseSensibilityRva = 0x3BF2FA8;
 constexpr std::uintptr_t kCopyViewRva = 0x64A90;
 constexpr std::uintptr_t kCopyCallsiteRva = 0xA395A6;
 constexpr unsigned char kExpectedCallBytes[5] = {0xE8, 0xE5, 0xB4, 0x62, 0xFF};
+constexpr unsigned char kExpectedCopyViewBytes[32] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
+    0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x41,
+    0x56, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x02, 0x4C,
+    0x8B, 0xF2, 0x48, 0x8B, 0xF1, 0x89, 0x01, 0x0F,
+};
 
 constexpr std::uintptr_t kRenderModelGpuCopyRva = 0x3ACD00;
 constexpr std::size_t kRenderModelGpuCopyHookLength = 19;
@@ -56,6 +65,9 @@ constexpr std::size_t kRenderModelPreviousMvpMatrixOffset = 0x1E0;
 constexpr std::size_t kRenderModelDepthHackOffset = 0x18B8;
 constexpr std::size_t kRenderModelOwnerOffset = 0x1C50;
 constexpr std::uintptr_t kRenderModelStaticVtableRva = 0x1E55208;
+constexpr std::array<std::uintptr_t, 4> kExpectedRenderModelStaticVtableTargets = {
+    0x224400, 0x2243F0, 0x2243E0, 0x2DA6D0,
+};
 
 constexpr std::uintptr_t kShadowCasterBuildRvas[2] = {0x3CA3B0, 0x3CACE0};
 constexpr std::size_t kShadowCasterBuildHookLength = 15;
@@ -71,6 +83,9 @@ constexpr std::size_t kShadowCasterMatrixPointerOffset = 0x08;
 constexpr std::size_t kShadowCasterProxyCapacity = 4096;
 
 constexpr std::uintptr_t kSkinnedModelVtableRva = 0x1E55008;
+constexpr std::array<std::uintptr_t, 4> kExpectedSkinnedModelVtableTargets = {
+    0x224400, 0x2243F0, 0x2243E0, 0x2CF590,
+};
 constexpr std::uintptr_t kSkinnedPoseUploadRva = 0x2D0C80;
 constexpr std::size_t kSkinnedPoseUploadHookLength = 17;
 constexpr unsigned char kExpectedSkinnedPoseUploadBytes[kSkinnedPoseUploadHookLength] = {
@@ -139,8 +154,12 @@ std::array<void*, 2> g_shadowCasterBuildTrampolines{};
 void* g_renderModelGpuCopyTrampoline = nullptr;
 void* g_skinnedPoseUploadTrampoline = nullptr;
 std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_transformInterpolationRuntimeEnabled{true};
+std::atomic<bool> g_skeletalInterpolationRuntimeEnabled{true};
+std::atomic<bool> g_firstPersonHandsRuntimeEnabled{true};
 std::atomic<bool> g_initializationStarted{false};
 bool g_f10WasDown = false;
+bool g_f11WasDown = false;
 HANDLE g_telemetryMapping = nullptr;
 bool g_unlockAbove120 = false;
 bool g_stabilizeMouseSensitivity = false;
@@ -151,7 +170,10 @@ bool g_interpolateShadowTransforms = false;
 bool g_interpolateFirstPersonSkeletons = false;
 bool g_interpolateWorldSkeletons = false;
 bool g_interpolateCinematicSkeletons = false;
+bool g_enableAdaptiveInterpolation = false;
 bool g_enableTelemetry = false;
+bool g_enableInterpolationAbProbe = false;
+std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
 std::atomic<int> g_unlockState{0};
 std::atomic<int> g_mouseStabilizationState{0};
 std::atomic<int> g_firstPersonRenderState{0};
@@ -175,6 +197,9 @@ std::atomic<int> g_worldSkeletalRenderState{0};
 std::atomic<std::uint64_t> g_worldSkeletalAdjustedCount{0};
 std::atomic<int> g_firstPersonSkeletalRenderState{0};
 std::atomic<std::uint64_t> g_firstPersonSkeletalAdjustedCount{0};
+std::atomic<std::uint64_t> g_abRenderModelHookCalls{0};
+std::atomic<std::uint64_t> g_abFirstPersonRootCorrections{0};
+std::atomic<std::uint64_t> g_abSkeletalHookCalls{0};
 
 struct WorldTransformDiagnostics {
     std::atomic<std::uint64_t> candidates{0};
@@ -317,6 +342,9 @@ std::atomic<std::uint64_t> g_presentationSerial{0};
 
 void PublishPresentationContext();
 bool ReadPresentationContext(PresentationContext& context);
+bool RuntimeTransformInterpolationEnabled();
+bool RuntimeSkeletalInterpolationEnabled();
+bool RuntimeFirstPersonHandsEnabled();
 
 struct WorldTransformTrack {
     const void* renderModel = nullptr;
@@ -525,6 +553,93 @@ struct SkeletalPreparedUpload {
     bool cinematic = false;
 };
 
+constexpr double kAbProbeWarmupSeconds = 2.0;
+constexpr double kAbProbeHistogramBinMilliseconds = 0.25;
+constexpr std::size_t kAbProbeHistogramBinCount = 401;
+
+struct InterpolationAbCounterSnapshot {
+    std::uint64_t renderModelHookCalls = 0;
+    std::uint64_t firstPersonRootCorrections = 0;
+    std::uint64_t worldCandidates = 0;
+    std::uint64_t worldAdjustments = 0;
+    std::uint64_t skeletalHookCalls = 0;
+    std::uint64_t skeletalPrepareCalls = 0;
+    std::uint64_t skeletalAdjustments = 0;
+    std::uint64_t forcedUploads = 0;
+};
+
+struct InterpolationAbProbeState {
+    bool capturing = false;
+    bool hasPreviousFrame = false;
+    bool samplingStarted = false;
+    bool transformInterpolationEnabled = true;
+    bool skeletalInterpolationEnabled = true;
+    bool firstPersonHandsEnabled = true;
+    std::uint64_t segmentId = 0;
+    std::uint64_t startPresentationSerial = 0;
+    std::uint64_t sampleStartPresentationSerial = 0;
+    std::uint64_t lastPresentationSerial = 0;
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER segmentStartCounter{};
+    LARGE_INTEGER previousFrameCounter{};
+    double previousScaledTime = 0.0;
+    double previousSimulationTime = 0.0;
+    std::uint64_t warmupFrames = 0;
+    std::uint64_t sampledFrames = 0;
+    std::uint64_t cadenceFrames = 0;
+    std::uint64_t zeroTickFrames = 0;
+    std::uint64_t oneTickFrames = 0;
+    std::uint64_t multipleTickFrames = 0;
+    std::uint64_t invalidCadenceFrames = 0;
+    double sampledSeconds = 0.0;
+    double simulationTicks = 0.0;
+    double minimumFrameMilliseconds = std::numeric_limits<double>::infinity();
+    double maximumFrameMilliseconds = 0.0;
+    std::array<std::uint64_t, kAbProbeHistogramBinCount> histogram{};
+    InterpolationAbCounterSnapshot countersAtStart{};
+};
+
+InterpolationAbProbeState g_interpolationAbProbe;
+std::uint64_t g_nextInterpolationAbSegmentId = 1;
+
+enum class AdaptiveInterpolationMode {
+    All,
+    TransformsOnly,
+    Off,
+};
+
+constexpr double kAdaptiveWindowSimulationTicks = 180.0;
+constexpr double kAdaptiveAllMinimumFps = 130.0;
+constexpr double kAdaptiveTransformsMinimumFps = 125.0;
+constexpr double kAdaptiveAllRecoveryFps = 150.0;
+constexpr double kAdaptiveTransformsRecoveryFps = 135.0;
+constexpr double kAdaptiveAllCostRefreshMinimumFps = 200.0;
+constexpr double kAdaptiveTransformCostRefreshMinimumFps = 180.0;
+constexpr double kAdaptiveCostRefreshFrameTimeRatio = 0.75;
+constexpr std::uint32_t kAdaptiveRecoveryWindowCount = 2;
+
+struct AdaptiveInterpolationGateState {
+    AdaptiveInterpolationMode mode = AdaptiveInterpolationMode::All;
+    bool initialized = false;
+    bool learnSkeletalPenalty = false;
+    bool learnTransformPenalty = false;
+    double previousScaledTime = 0.0;
+    double previousSimulationTime = 0.0;
+    double windowFrames = 0.0;
+    double windowSimulationTicks = 0.0;
+    double lastAllFrameSeconds = 0.0;
+    double lastTransformFrameSeconds = 0.0;
+    double skeletalPenaltySeconds = 0.0;
+    double transformPenaltySeconds = 0.0;
+    double skeletalPenaltyReferenceFrameSeconds = 0.0;
+    double transformPenaltyReferenceFrameSeconds = 0.0;
+    bool hasSkeletalPenalty = false;
+    bool hasTransformPenalty = false;
+    std::uint32_t recoveryWindows = 0;
+};
+
+AdaptiveInterpolationGateState g_adaptiveInterpolationGate;
+
 void BuildSiblingPath(wchar_t* output, std::size_t capacity, const wchar_t* filename) {
     output[0] = L'\0';
     GetModuleFileNameW(g_pluginModule, output, static_cast<DWORD>(capacity));
@@ -579,13 +694,18 @@ void LoadConfiguration() {
         L"Interpolation", L"WorldSkeletons", 0, path) != 0;
     g_interpolateCinematicSkeletons = GetPrivateProfileIntW(
         L"Interpolation", L"CinematicSkeletons", 0, path) != 0;
+    g_enableAdaptiveInterpolation = GetPrivateProfileIntW(
+        L"Interpolation", L"AdaptivePerformanceGate", 1, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
+    g_enableInterpolationAbProbe = GetPrivateProfileIntW(
+        L"Diagnostics", L"InterpolationABProbe", 0, path) != 0;
     Log("Configuration: UnlockAbove120=%u, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
         "FirstPersonSkeletons=%u, WorldSkeletons=%u, "
-        "CinematicSkeletons=%u, Telemetry=%u.",
+        "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, Telemetry=%u, "
+        "InterpolationABProbe=%u.",
         g_unlockAbove120 ? 1U : 0U, g_stabilizeMouseSensitivity ? 1U : 0U,
         g_stabilizeFirstPersonHands ? 1U : 0U,
         g_interpolateWorldTransforms ? 1U : 0U,
@@ -594,7 +714,24 @@ void LoadConfiguration() {
         g_interpolateFirstPersonSkeletons ? 1U : 0U,
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U,
-        g_enableTelemetry ? 1U : 0U);
+        g_enableAdaptiveInterpolation ? 1U : 0U,
+        g_enableTelemetry ? 1U : 0U,
+        g_enableInterpolationAbProbe ? 1U : 0U);
+    if (g_enableInterpolationAbProbe) {
+        Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
+            "F11 toggles all configured interpolation; Alt+F11 cycles all, "
+            "transforms-only, skeletons-only, and off; Shift+F11 toggles only "
+            "first-person root stabilization. Camera prediction, mouse "
+            "stabilization, and the FPS unlock remain unchanged.");
+        if (g_enableAdaptiveInterpolation) {
+            Log("Adaptive interpolation is suspended while "
+                "InterpolationABProbe=1 so benchmark profiles remain fixed.");
+        }
+    } else if (g_enableAdaptiveInterpolation) {
+        Log("Adaptive interpolation gate enabled: skeletal interpolation is "
+            "shed before transform interpolation, with cadence hysteresis and "
+            "measured-cost recovery.");
+    }
 }
 
 bool ComputeFileSha256(const wchar_t* path, unsigned char output[32]) {
@@ -659,29 +796,282 @@ cleanup:
     return success;
 }
 
-bool VerifyExecutable() {
-    wchar_t path[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) {
-        Log("Unable to obtain the executable path; patch not installed.");
+struct ExecutableImageLayout {
+    const IMAGE_NT_HEADERS64* headers = nullptr;
+    const IMAGE_SECTION_HEADER* sections = nullptr;
+    std::uint16_t sectionCount = 0;
+    std::uint32_t imageSize = 0;
+};
+
+const IMAGE_SECTION_HEADER* FindImageSection(
+    const ExecutableImageLayout& image, std::uintptr_t rva,
+    std::size_t size) {
+    if (size == 0 || rva >= image.imageSize ||
+        size > static_cast<std::size_t>(image.imageSize - rva)) {
+        return nullptr;
+    }
+
+    for (std::uint16_t index = 0; index < image.sectionCount; ++index) {
+        const IMAGE_SECTION_HEADER& section = image.sections[index];
+        const std::uintptr_t start = section.VirtualAddress;
+        const std::uintptr_t span = std::max<std::uintptr_t>(
+            section.Misc.VirtualSize, section.SizeOfRawData);
+        if (rva >= start && rva - start < span &&
+            size <= span - static_cast<std::size_t>(rva - start)) {
+            return &section;
+        }
+    }
+    return nullptr;
+}
+
+bool ReadExecutableImageLayout(ExecutableImageLayout& image) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_executableBase);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        dos->e_lfanew > 0x100000) {
+        Log("Executable does not have a valid DOS/PE header; patch not installed.");
         return false;
     }
 
-    unsigned char actualHash[32]{};
-    if (!ComputeFileSha256(path, actualHash)) {
-        Log("Unable to hash Dishonored2.exe; patch not installed.");
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        g_executableBase + static_cast<std::uintptr_t>(dos->e_lfanew));
+    if (headers->Signature != IMAGE_NT_SIGNATURE ||
+        headers->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        headers->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        headers->FileHeader.NumberOfSections == 0 ||
+        headers->FileHeader.NumberOfSections > 96 ||
+        headers->OptionalHeader.SizeOfImage == 0) {
+        Log("Executable is not a structurally valid PE32+ x64 image; patch not installed.");
         return false;
     }
-    if (memcmp(actualHash, kExpectedExecutableSha256, sizeof(actualHash)) != 0) {
-        Log("Dishonored2.exe SHA-256 does not match GOG 1.77.9.0; patch not installed.");
+
+    image.headers = headers;
+    image.sections = IMAGE_FIRST_SECTION(headers);
+    image.sectionCount = headers->FileHeader.NumberOfSections;
+    image.imageSize = headers->OptionalHeader.SizeOfImage;
+    return true;
+}
+
+bool ValidateImageRange(const ExecutableImageLayout& image,
+                        std::uintptr_t rva, std::size_t size,
+                        DWORD requiredCharacteristics,
+                        DWORD forbiddenCharacteristics,
+                        const char* description) {
+    const IMAGE_SECTION_HEADER* section = FindImageSection(image, rva, size);
+    if (section == nullptr ||
+        (section->Characteristics & requiredCharacteristics) != requiredCharacteristics ||
+        (section->Characteristics & forbiddenCharacteristics) != 0) {
+        Log("Executable layout check failed for %s at RVA 0x%llX; patch not installed.",
+            description, static_cast<unsigned long long>(rva));
+        return false;
+    }
+    return true;
+}
+
+bool ValidateCodeRange(const ExecutableImageLayout& image,
+                       std::uintptr_t rva, std::size_t size,
+                       const char* description) {
+    return ValidateImageRange(
+        image, rva, size, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        IMAGE_SCN_MEM_WRITE, description);
+}
+
+bool ValidateMutableDataRange(const ExecutableImageLayout& image,
+                              std::uintptr_t rva, std::size_t size,
+                              const char* description) {
+    return ValidateImageRange(
+        image, rva, size, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+        IMAGE_SCN_MEM_EXECUTE, description);
+}
+
+bool ValidateVtable(const ExecutableImageLayout& image,
+                    std::uintptr_t rva,
+                    const std::array<std::uintptr_t, 4>& expectedTargets,
+                    const char* description) {
+    const std::size_t entriesToValidate = expectedTargets.size();
+    if (!ValidateImageRange(image, rva,
+                            entriesToValidate * sizeof(std::uintptr_t),
+                            IMAGE_SCN_MEM_READ,
+                            IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE,
+                            description)) {
+        return false;
+    }
+
+    const auto* entries = reinterpret_cast<const std::uintptr_t*>(
+        g_executableBase + rva);
+    for (std::size_t index = 0; index < entriesToValidate; ++index) {
+        if (entries[index] < g_executableBase) {
+            Log("Executable layout check failed for %s entry %llu; patch not installed.",
+                description, static_cast<unsigned long long>(index));
+            return false;
+        }
+        const std::uintptr_t targetRva = entries[index] - g_executableBase;
+        if (targetRva != expectedTargets[index] ||
+            !ValidateCodeRange(image, targetRva, 1, description)) {
+            Log("Executable call relationship check failed for %s entry %llu; "
+                "patch not installed.", description,
+                static_cast<unsigned long long>(index));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
+    if (!ValidateCodeRange(image, kCopyCallsiteRva, sizeof(kExpectedCallBytes),
+                           "renderer view-copy call site") ||
+        !ValidateCodeRange(image, kCopyViewRva, sizeof(kExpectedCopyViewBytes),
+                           "renderer view-copy target")) {
         return false;
     }
 
     const auto* callsite = reinterpret_cast<const unsigned char*>(
         g_executableBase + kCopyCallsiteRva);
-    if (memcmp(callsite, kExpectedCallBytes, sizeof(kExpectedCallBytes)) != 0) {
-        Log("View-copy call-site bytes do not match; patch not installed.");
+    if (callsite[0] != 0xE8) {
+        Log("Renderer view-copy site is not a direct call; patch not installed.");
         return false;
     }
+    std::int32_t displacement = 0;
+    memcpy(&displacement, callsite + 1, sizeof(displacement));
+    const std::uintptr_t target = static_cast<std::uintptr_t>(
+        static_cast<std::int64_t>(g_executableBase + kCopyCallsiteRva + 5) +
+        displacement);
+    if (target != g_executableBase + kCopyViewRva ||
+        memcmp(callsite, kExpectedCallBytes, sizeof(kExpectedCallBytes)) != 0 ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + kCopyViewRva),
+               kExpectedCopyViewBytes, sizeof(kExpectedCopyViewBytes)) != 0) {
+        Log("Renderer view-copy call relationship does not match the supported layout; "
+            "patch not installed.");
+        return false;
+    }
+    return true;
+}
+
+bool ValidateHookSignatures(const ExecutableImageLayout& image) {
+    const bool rendererModelFeatures =
+        g_stabilizeFirstPersonHands || g_interpolateWorldTransforms ||
+        g_interpolateCinematicTransforms;
+    const bool skeletalFeatures =
+        g_interpolateWorldSkeletons || g_interpolateFirstPersonSkeletons ||
+        g_interpolateCinematicSkeletons;
+
+    if (rendererModelFeatures) {
+        if (!ValidateCodeRange(image, kRenderModelGpuCopyRva,
+                               sizeof(kExpectedRenderModelGpuCopyBytes),
+                               "renderer model GPU-copy hook") ||
+            memcmp(reinterpret_cast<const void*>(
+                       g_executableBase + kRenderModelGpuCopyRva),
+                   kExpectedRenderModelGpuCopyBytes,
+                   sizeof(kExpectedRenderModelGpuCopyBytes)) != 0 ||
+            !ValidateVtable(image, kRenderModelStaticVtableRva,
+                            kExpectedRenderModelStaticVtableTargets,
+                            "static render-model vtable") ||
+            !ValidateVtable(image, kSkinnedModelVtableRva,
+                            kExpectedSkinnedModelVtableTargets,
+                            "skinned render-model vtable")) {
+            Log("Renderer model correction layout/signature validation failed; "
+                "patch not installed.");
+            return false;
+        }
+    }
+
+    if (skeletalFeatures) {
+        if (!ValidateCodeRange(image, kSkinnedPoseUploadRva,
+                               sizeof(kExpectedSkinnedPoseUploadBytes),
+                               "skinned-pose upload hook") ||
+            memcmp(reinterpret_cast<const void*>(
+                       g_executableBase + kSkinnedPoseUploadRva),
+                   kExpectedSkinnedPoseUploadBytes,
+                   sizeof(kExpectedSkinnedPoseUploadBytes)) != 0 ||
+            !ValidateVtable(image, kSkinnedModelVtableRva,
+                            kExpectedSkinnedModelVtableTargets,
+                            "skinned render-model vtable")) {
+            Log("Skeletal correction layout/signature validation failed; "
+                "patch not installed.");
+            return false;
+        }
+    }
+
+    if (g_interpolateShadowTransforms) {
+        for (std::size_t index = 0; index < 2; ++index) {
+            if (!ValidateCodeRange(image, kShadowCasterBuildRvas[index],
+                                   kShadowCasterBuildHookLength,
+                                   "shadow caster-build hook") ||
+                memcmp(reinterpret_cast<const void*>(
+                           g_executableBase + kShadowCasterBuildRvas[index]),
+                       kExpectedShadowCasterBuildBytes[index],
+                       kShadowCasterBuildHookLength) != 0) {
+                Log("Shadow correction layout/signature validation failed; "
+                    "patch not installed.");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void LogExecutableHash(const wchar_t* path) {
+    unsigned char actualHash[32]{};
+    if (!ComputeFileSha256(path, actualHash)) {
+        Log("Unable to hash Dishonored2.exe; continuing with runtime layout validation.");
+        return;
+    }
+
+    if (memcmp(actualHash, kExpectedExecutableSha256, sizeof(actualHash)) == 0) {
+        Log("Recognized the validated GOG 1.77.9.0 executable SHA-256.");
+        return;
+    }
+
+    char hashText[65]{};
+    for (std::size_t index = 0; index < sizeof(actualHash); ++index) {
+        sprintf_s(hashText + index * 2, sizeof(hashText) - index * 2,
+                  "%02X", actualHash[index]);
+    }
+    Log("Executable SHA-256 %s is not the reference hash; attempting strict "
+        "runtime layout validation.", hashText);
+}
+
+bool VerifyExecutableLayout() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD pathLength = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (pathLength == 0 || pathLength >= MAX_PATH) {
+        Log("Unable to obtain the executable path; patch not installed.");
+        return false;
+    }
+
+    const wchar_t* filename = wcsrchr(path, L'\\');
+    filename = filename == nullptr ? path : filename + 1;
+    if (_wcsicmp(filename, L"Dishonored2.exe") != 0) {
+        Log("Host executable is not Dishonored2.exe; patch not installed.");
+        return false;
+    }
+
+    LogExecutableHash(path);
+
+    ExecutableImageLayout image{};
+    if (!ReadExecutableImageLayout(image) ||
+        !ValidateViewCopyCallRelationship(image) ||
+        !ValidateMutableDataRange(image, kGamePointerRva,
+                                  sizeof(std::uintptr_t),
+                                  "idGameLocal pointer") ||
+        !ValidateVtable(image, kGameVtableRva,
+                        kExpectedGameVtableTargets,
+                        "idGameLocal vtable") ||
+        (g_unlockAbove120 &&
+         (!ValidateMutableDataRange(image, kFrameSpinningRva, sizeof(LONG),
+                                    "frame-spinning cvar cache") ||
+          !ValidateMutableDataRange(image, kTripleBufferingRva, sizeof(LONG),
+                                    "triple-buffering cvar cache"))) ||
+        (g_stabilizeMouseSensitivity &&
+         !ValidateMutableDataRange(image, kFixMouseSensibilityRva,
+                                   sizeof(LONG),
+                                   "mouse-sensitivity cvar cache")) ||
+        !ValidateHookSignatures(image)) {
+        return false;
+    }
+
+    Log("Executable passed strict runtime layout validation; all enabled "
+        "correction paths were validated before hook installation.");
     return true;
 }
 
@@ -1987,7 +2377,9 @@ ShadowCorrectionEntry* FindShadowCorrectionByContent(
 
 void PublishShadowCorrection(const void* renderModel,
                              const WorldMatrixCorrection& correction) {
-    if (!g_interpolateShadowTransforms || renderModel == nullptr ||
+    if (!RuntimeTransformInterpolationEnabled() ||
+        !g_interpolateShadowTransforms ||
+        renderModel == nullptr ||
         correction.presentationSerial == 0) {
         return;
     }
@@ -2088,7 +2480,9 @@ bool ReadShadowCorrection(const void* matrix, const Matrix4& raw,
 
 bool BuildShadowMatrix(const float* source, Matrix4& corrected) {
     g_shadowMatrixCalls.fetch_add(1, std::memory_order_relaxed);
-    if (!g_interpolateShadowTransforms || source == nullptr) {
+    if (!RuntimeTransformInterpolationEnabled() ||
+        !g_interpolateShadowTransforms ||
+        source == nullptr) {
         return false;
     }
     // The caster list can contain entries that the engine rejects before it
@@ -2124,7 +2518,9 @@ bool BuildShadowMatrix(const float* source, Matrix4& corrected) {
 bool BuildShadowCasterProxyList(std::uint64_t* sourceList,
                                 std::uint64_t (&proxyList)[2]) {
     g_shadowCasterProxyCalls.fetch_add(1, std::memory_order_relaxed);
-    if (!g_interpolateShadowTransforms || sourceList == nullptr) {
+    if (!RuntimeTransformInterpolationEnabled() ||
+        !g_interpolateShadowTransforms ||
+        sourceList == nullptr) {
         return false;
     }
     const std::size_t count =
@@ -3731,8 +4127,14 @@ bool CorrectWorldRenderModelClone(unsigned char* object,
 
 extern "C" void __fastcall HookRenderModelGpuCopy(
     void* state, void* renderContext, float parameter, void* drawSurface) {
-    if ((!g_stabilizeFirstPersonHands && !g_interpolateWorldTransforms &&
-         !g_interpolateCinematicTransforms) ||
+    if (g_enableInterpolationAbProbe) {
+        g_abRenderModelHookCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool firstPersonHandsEnabled = RuntimeFirstPersonHandsEnabled();
+    const bool transformInterpolationEnabled =
+        RuntimeTransformInterpolationEnabled() &&
+        (g_interpolateWorldTransforms || g_interpolateCinematicTransforms);
+    if ((!firstPersonHandsEnabled && !transformInterpolationEnabled) ||
         g_renderModelGpuCopyTrampoline == nullptr ||
         !IsReadableMemory(drawSurface, 16)) {
         g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
@@ -3750,6 +4152,33 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     memcpy(&renderModelVtable, renderModel, sizeof(renderModelVtable));
     const bool exactSkinned =
         renderModelVtable == g_executableBase + kSkinnedModelVtableRva;
+    bool correctedFirstPerson = false;
+    std::uint64_t correctionSerial = 0;
+    RenderCorrectionState firstPersonCorrection{};
+    WorldMatrixCorrection worldCorrection{};
+    bool hasCorrection = false;
+
+    if (firstPersonHandsEnabled && IsPlayerDepthHackObject(renderModel)) {
+        if (ReadRenderCorrection(firstPersonCorrection)) {
+            hasCorrection = true;
+            correctedFirstPerson = true;
+            correctionSerial = firstPersonCorrection.serial;
+        }
+    } else if (transformInterpolationEnabled) {
+        PresentationContext context{};
+        if (ReadPresentationContext(context) &&
+            BuildWorldTransformCorrection(renderModel, context,
+                                          worldCorrection)) {
+            hasCorrection = true;
+            correctionSerial = worldCorrection.presentationSerial;
+        }
+    }
+
+    if (!hasCorrection) {
+        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        return;
+    }
+
     const std::size_t renderModelCloneSize =
         exactSkinned ? kSkinnedModelSize : kRenderModelSize;
     if (!IsReadableMemory(renderModel, renderModelCloneSize)) {
@@ -3757,36 +4186,18 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
                                      drawSurface);
         return;
     }
-    alignas(16) unsigned char renderModelClone[kSkinnedModelSize]{};
+    alignas(16) unsigned char renderModelClone[kSkinnedModelSize];
     memcpy(renderModelClone, renderModel, renderModelCloneSize);
-    bool corrected = false;
-    bool correctedFirstPerson = false;
-    std::uint64_t correctionSerial = 0;
-
-    if (g_stabilizeFirstPersonHands && IsPlayerDepthHackObject(renderModel)) {
-        RenderCorrectionState correction{};
-        if (ReadRenderCorrection(correction) &&
-            CorrectRenderModelClone(renderModelClone, correction)) {
-            corrected = true;
-            correctedFirstPerson = true;
-            correctionSerial = correction.serial;
-        }
-    } else if (g_interpolateWorldTransforms ||
-               g_interpolateCinematicTransforms) {
-        PresentationContext context{};
-        WorldMatrixCorrection correction{};
-        if (ReadPresentationContext(context) &&
-            BuildWorldTransformCorrection(renderModel, context, correction) &&
-            CorrectWorldRenderModelClone(renderModelClone, correction)) {
-            PublishShadowCorrection(renderModel, correction);
-            corrected = true;
-            correctionSerial = correction.presentationSerial;
-        }
-    }
-
+    const bool corrected = correctedFirstPerson
+        ? CorrectRenderModelClone(renderModelClone, firstPersonCorrection)
+        : CorrectWorldRenderModelClone(renderModelClone, worldCorrection);
     if (!corrected) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        g_originalRenderModelGpuCopy(state, renderContext, parameter,
+                                     drawSurface);
         return;
+    }
+    if (!correctedFirstPerson) {
+        PublishShadowCorrection(renderModel, worldCorrection);
     }
 
     alignas(16) unsigned char drawSurfaceProxy[16]{};
@@ -3800,6 +4211,10 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     memcpy(state, &renderModel, sizeof(renderModel));
 
     if (correctedFirstPerson) {
+        if (g_enableInterpolationAbProbe) {
+            g_abFirstPersonRootCorrections.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         int expected = 0;
         if (g_firstPersonRenderState.compare_exchange_strong(expected, 1)) {
             Log("Applied first-person correction at the renderer GPU-parameter boundary "
@@ -3823,13 +4238,22 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
 
 extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
     void* renderModel, void* renderContext) {
-    std::array<d2_pose::JointMatrix, kMaximumJointCount> interpolatedPalette{};
+    if (g_enableInterpolationAbProbe) {
+        g_abSkeletalHookCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!RuntimeSkeletalInterpolationEnabled() ||
+        (!g_interpolateWorldSkeletons &&
+         !g_interpolateFirstPersonSkeletons &&
+         !g_interpolateCinematicSkeletons) ||
+        g_skinnedPoseUploadTrampoline == nullptr) {
+        return g_originalSkinnedPoseUpload(renderModel, renderContext);
+    }
+
+    // PrepareSkeletalPose initializes every byte that can be consumed when it
+    // succeeds; avoid zeroing this 12 KiB buffer on every rejected hook call.
+    std::array<d2_pose::JointMatrix, kMaximumJointCount> interpolatedPalette;
     SkeletalPreparedUpload prepared{};
-    if ((g_interpolateWorldSkeletons ||
-         g_interpolateFirstPersonSkeletons ||
-         g_interpolateCinematicSkeletons) &&
-        g_skinnedPoseUploadTrampoline != nullptr &&
-        PrepareSkeletalPose(renderModel, interpolatedPalette, prepared)) {
+    if (PrepareSkeletalPose(renderModel, interpolatedPalette, prepared)) {
         auto* bytes = static_cast<unsigned char*>(renderModel);
         void* sourcePalette = nullptr;
         memcpy(&sourcePalette, bytes + kSkinnedPoseCpuListOffset,
@@ -4004,6 +4428,597 @@ bool ReadPresentationContext(PresentationContext& context) {
     return context.valid && context.serial != 0;
 }
 
+bool HasConfiguredTransformInterpolationLayers() {
+    return g_interpolateWorldTransforms ||
+           g_interpolateCinematicTransforms ||
+           g_interpolateShadowTransforms;
+}
+
+bool HasConfiguredSkeletalInterpolationLayers() {
+    return g_interpolateFirstPersonSkeletons ||
+           g_interpolateWorldSkeletons ||
+           g_interpolateCinematicSkeletons;
+}
+
+bool HasConfiguredInterpolationLayers() {
+    return HasConfiguredTransformInterpolationLayers() ||
+           HasConfiguredSkeletalInterpolationLayers();
+}
+
+bool RuntimeTransformInterpolationEnabled() {
+    return HasConfiguredTransformInterpolationLayers() &&
+           g_transformInterpolationRuntimeEnabled.load(
+               std::memory_order_relaxed);
+}
+
+bool RuntimeSkeletalInterpolationEnabled() {
+    return HasConfiguredSkeletalInterpolationLayers() &&
+           g_skeletalInterpolationRuntimeEnabled.load(
+               std::memory_order_relaxed);
+}
+
+bool RuntimeFirstPersonHandsEnabled() {
+    return g_stabilizeFirstPersonHands &&
+           g_firstPersonHandsRuntimeEnabled.load(std::memory_order_relaxed);
+}
+
+const char* AdaptiveInterpolationModeName(AdaptiveInterpolationMode mode) {
+    switch (mode) {
+        case AdaptiveInterpolationMode::All:
+            return "all";
+        case AdaptiveInterpolationMode::TransformsOnly:
+            return "transforms-only";
+        case AdaptiveInterpolationMode::Off:
+            return "off";
+    }
+    return "unknown";
+}
+
+void SetAdaptiveInterpolationMode(AdaptiveInterpolationMode mode,
+                                  double measuredFps,
+                                  double predictedFps,
+                                  const char* reason) {
+    g_adaptiveInterpolationGate.mode = mode;
+    g_adaptiveInterpolationGate.recoveryWindows = 0;
+    g_transformInterpolationRuntimeEnabled.store(
+        mode != AdaptiveInterpolationMode::Off,
+        std::memory_order_relaxed);
+    g_skeletalInterpolationRuntimeEnabled.store(
+        mode == AdaptiveInterpolationMode::All,
+        std::memory_order_relaxed);
+    if (std::isfinite(predictedFps)) {
+        Log("Adaptive interpolation -> %s: measured cadence %.2f FPS, "
+            "predicted next-profile cadence %.2f FPS (%s).",
+            AdaptiveInterpolationModeName(mode), measuredFps, predictedFps,
+            reason);
+    } else {
+        Log("Adaptive interpolation -> %s: measured cadence %.2f FPS (%s).",
+            AdaptiveInterpolationModeName(mode), measuredFps, reason);
+    }
+}
+
+void ResetAdaptiveInterpolationWindow() {
+    g_adaptiveInterpolationGate.windowFrames = 0.0;
+    g_adaptiveInterpolationGate.windowSimulationTicks = 0.0;
+}
+
+void SuspendAdaptiveInterpolationForManualControl() {
+    if (g_enableAdaptiveInterpolation && !g_enableInterpolationAbProbe &&
+        !g_adaptiveInterpolationManualOverride.exchange(
+            true, std::memory_order_relaxed)) {
+        Log("Adaptive interpolation suspended until the next game launch "
+            "because a manual interpolation profile was selected.");
+    }
+}
+
+void UpdateAdaptiveInterpolationGate(const PresentationContext& context) {
+    if (!g_enableAdaptiveInterpolation || g_enableInterpolationAbProbe ||
+        g_adaptiveInterpolationManualOverride.load(std::memory_order_relaxed) ||
+        !context.valid) {
+        return;
+    }
+
+    AdaptiveInterpolationGateState& gate = g_adaptiveInterpolationGate;
+    if (!gate.initialized) {
+        gate.initialized = true;
+        gate.previousScaledTime = context.scaledTime;
+        gate.previousSimulationTime = context.simulationTime;
+        gate.mode = AdaptiveInterpolationMode::All;
+        return;
+    }
+
+    const double scaledDelta = context.scaledTime - gate.previousScaledTime;
+    const double simulationDelta =
+        context.simulationTime - gate.previousSimulationTime;
+    gate.previousScaledTime = context.scaledTime;
+    gate.previousSimulationTime = context.simulationTime;
+    if (!(scaledDelta > kTimeEpsilon) || scaledDelta > 0.25 ||
+        simulationDelta < -kTimeEpsilon || simulationDelta > 0.10) {
+        ResetAdaptiveInterpolationWindow();
+        gate.recoveryWindows = 0;
+        return;
+    }
+
+    gate.windowFrames += 1.0;
+    gate.windowSimulationTicks +=
+        std::max(0.0, simulationDelta) / kNativeSimulationStep;
+    if (gate.windowSimulationTicks < kAdaptiveWindowSimulationTicks) {
+        return;
+    }
+
+    const double cadenceFps = (1.0 / kNativeSimulationStep) *
+        gate.windowFrames / gate.windowSimulationTicks;
+    ResetAdaptiveInterpolationWindow();
+    if (!(cadenceFps > 1.0) || !std::isfinite(cadenceFps)) {
+        gate.recoveryWindows = 0;
+        return;
+    }
+    const double frameSeconds = 1.0 / cadenceFps;
+
+    if (gate.mode == AdaptiveInterpolationMode::All) {
+        gate.recoveryWindows = 0;
+        if (cadenceFps < kAdaptiveAllMinimumFps) {
+            gate.lastAllFrameSeconds = frameSeconds;
+            gate.learnSkeletalPenalty = true;
+            SetAdaptiveInterpolationMode(
+                AdaptiveInterpolationMode::TransformsOnly, cadenceFps,
+                std::numeric_limits<double>::quiet_NaN(),
+                "full interpolation lacks useful native-rate headroom");
+        }
+        return;
+    }
+
+    if (gate.mode == AdaptiveInterpolationMode::TransformsOnly) {
+        if (gate.learnSkeletalPenalty) {
+            gate.skeletalPenaltySeconds = std::max(
+                0.0, gate.lastAllFrameSeconds - frameSeconds);
+            gate.skeletalPenaltyReferenceFrameSeconds = frameSeconds;
+            gate.hasSkeletalPenalty = true;
+            gate.learnSkeletalPenalty = false;
+            Log("Adaptive interpolation learned skeletal cost %.3f ms/frame.",
+                gate.skeletalPenaltySeconds * 1000.0);
+        }
+        if (cadenceFps < kAdaptiveTransformsMinimumFps) {
+            gate.lastTransformFrameSeconds = frameSeconds;
+            gate.learnTransformPenalty = true;
+            SetAdaptiveInterpolationMode(
+                AdaptiveInterpolationMode::Off, cadenceFps,
+                std::numeric_limits<double>::quiet_NaN(),
+                "transform-only interpolation remains below native-rate guard");
+            return;
+        }
+
+        const double predictedAllFps = gate.hasSkeletalPenalty
+            ? 1.0 / (frameSeconds + gate.skeletalPenaltySeconds)
+            : cadenceFps >= 200.0 ? cadenceFps
+                                  : std::numeric_limits<double>::quiet_NaN();
+        const bool predictedAllHasHeadroom =
+            std::isfinite(predictedAllFps) &&
+            predictedAllFps >= kAdaptiveAllRecoveryFps;
+        const bool skeletalCostContextChanged = gate.hasSkeletalPenalty &&
+            gate.skeletalPenaltyReferenceFrameSeconds > kTimeEpsilon &&
+            frameSeconds <= gate.skeletalPenaltyReferenceFrameSeconds *
+                kAdaptiveCostRefreshFrameTimeRatio &&
+            cadenceFps >= kAdaptiveAllCostRefreshMinimumFps;
+        if (predictedAllHasHeadroom || skeletalCostContextChanged) {
+            if (++gate.recoveryWindows >= kAdaptiveRecoveryWindowCount) {
+                SetAdaptiveInterpolationMode(
+                    AdaptiveInterpolationMode::All, cadenceFps,
+                    predictedAllFps,
+                    predictedAllHasHeadroom
+                        ? "measured headroom supports full interpolation"
+                        : "scene cadence improved enough to refresh skeletal cost");
+            }
+        } else {
+            gate.recoveryWindows = 0;
+        }
+        return;
+    }
+
+    if (gate.learnTransformPenalty) {
+        gate.transformPenaltySeconds = std::max(
+            0.0, gate.lastTransformFrameSeconds - frameSeconds);
+        gate.transformPenaltyReferenceFrameSeconds = frameSeconds;
+        gate.hasTransformPenalty = true;
+        gate.learnTransformPenalty = false;
+        Log("Adaptive interpolation learned transform cost %.3f ms/frame.",
+            gate.transformPenaltySeconds * 1000.0);
+    }
+    const double predictedTransformFps = gate.hasTransformPenalty
+        ? 1.0 / (frameSeconds + gate.transformPenaltySeconds)
+        : cadenceFps >= 180.0 ? cadenceFps
+                              : std::numeric_limits<double>::quiet_NaN();
+    const bool predictedTransformsHaveHeadroom =
+        std::isfinite(predictedTransformFps) &&
+        predictedTransformFps >= kAdaptiveTransformsRecoveryFps;
+    const bool transformCostContextChanged = gate.hasTransformPenalty &&
+        gate.transformPenaltyReferenceFrameSeconds > kTimeEpsilon &&
+        frameSeconds <= gate.transformPenaltyReferenceFrameSeconds *
+            kAdaptiveCostRefreshFrameTimeRatio &&
+        cadenceFps >= kAdaptiveTransformCostRefreshMinimumFps;
+    if (predictedTransformsHaveHeadroom || transformCostContextChanged) {
+        if (++gate.recoveryWindows >= kAdaptiveRecoveryWindowCount) {
+            SetAdaptiveInterpolationMode(
+                AdaptiveInterpolationMode::TransformsOnly, cadenceFps,
+                predictedTransformFps,
+                predictedTransformsHaveHeadroom
+                    ? "measured headroom supports transform interpolation"
+                    : "scene cadence improved enough to refresh transform cost");
+        }
+    } else {
+        gate.recoveryWindows = 0;
+    }
+}
+
+InterpolationAbCounterSnapshot CaptureInterpolationAbCounters() {
+    InterpolationAbCounterSnapshot counters{};
+    counters.renderModelHookCalls =
+        g_abRenderModelHookCalls.load(std::memory_order_relaxed);
+    counters.firstPersonRootCorrections =
+        g_abFirstPersonRootCorrections.load(std::memory_order_relaxed);
+    counters.worldCandidates =
+        g_worldDiagnostics.candidates.load(std::memory_order_relaxed);
+    counters.worldAdjustments =
+        g_worldTransformAdjustedCount.load(std::memory_order_relaxed);
+    counters.skeletalHookCalls =
+        g_abSkeletalHookCalls.load(std::memory_order_relaxed);
+    counters.skeletalPrepareCalls =
+        g_skeletalDiagnostics.calls.load(std::memory_order_relaxed);
+    counters.skeletalAdjustments =
+        g_skeletalDiagnostics.adjustedUploads.load(std::memory_order_relaxed);
+    counters.forcedUploads =
+        g_skeletalDiagnostics.forcedUploads.load(std::memory_order_relaxed);
+    return counters;
+}
+
+std::uint64_t CounterDelta(std::uint64_t current, std::uint64_t previous) {
+    return current >= previous ? current - previous : 0;
+}
+
+double InterpolationAbPercentile(double percentile) {
+    const std::uint64_t sampleCount = g_interpolationAbProbe.sampledFrames;
+    if (sampleCount == 0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const std::uint64_t target = static_cast<std::uint64_t>(
+        std::ceil(percentile * static_cast<double>(sampleCount)));
+    std::uint64_t cumulative = 0;
+    for (std::size_t index = 0;
+         index < g_interpolationAbProbe.histogram.size(); ++index) {
+        cumulative += g_interpolationAbProbe.histogram[index];
+        if (cumulative >= target) {
+            return (static_cast<double>(index) + 0.5) *
+                   kAbProbeHistogramBinMilliseconds;
+        }
+    }
+    return (static_cast<double>(kAbProbeHistogramBinCount) - 0.5) *
+           kAbProbeHistogramBinMilliseconds;
+}
+
+void ReportInterpolationAbSegment(const char* reason) {
+    if (!g_interpolationAbProbe.capturing) {
+        return;
+    }
+
+    const InterpolationAbCounterSnapshot current =
+        CaptureInterpolationAbCounters();
+    if (g_interpolationAbProbe.sampledFrames == 0 ||
+        !(g_interpolationAbProbe.sampledSeconds > 0.0)) {
+        Log("A/B segment %llu ended (%s): transforms=%s skeletons=%s hands=%s, "
+            "serial=%llu..%llu; no post-warm-up samples were captured.",
+            static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
+            reason,
+            g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+            g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
+            g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
+            static_cast<unsigned long long>(
+                g_interpolationAbProbe.startPresentationSerial),
+            static_cast<unsigned long long>(
+                g_interpolationAbProbe.lastPresentationSerial));
+        return;
+    }
+
+    const double averageFrameMilliseconds =
+        1000.0 * g_interpolationAbProbe.sampledSeconds /
+        static_cast<double>(g_interpolationAbProbe.sampledFrames);
+    const double averageFps =
+        static_cast<double>(g_interpolationAbProbe.sampledFrames) /
+        g_interpolationAbProbe.sampledSeconds;
+    const double cadenceFps =
+        g_interpolationAbProbe.simulationTicks > kTimeEpsilon
+            ? (1.0 / kNativeSimulationStep) *
+                  static_cast<double>(g_interpolationAbProbe.cadenceFrames) /
+                  g_interpolationAbProbe.simulationTicks
+            : std::numeric_limits<double>::quiet_NaN();
+
+    Log("A/B segment %llu ended (%s): transforms=%s skeletons=%s hands=%s, "
+        "serial=%llu..%llu, warmup=%.1fs/%llu frames, sample=%.3fs/%llu "
+        "frames; avg=%.3fms %.2fFPS, p50=%.3fms p95=%.3fms p99=%.3fms "
+        "min=%.3fms max=%.3fms; cadence=%.2fFPS ticks[zero=%llu one=%llu "
+        "multi=%llu invalid=%llu]; work[modelHooks=%llu fpRoots=%llu "
+        "worldCandidates=%llu worldAdjusted=%llu poseHooks=%llu "
+        "posePrepareCalls=%llu poseAdjusted=%llu forcedUploads=%llu].",
+        static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
+        reason,
+        g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
+        static_cast<unsigned long long>(
+            g_interpolationAbProbe.sampleStartPresentationSerial),
+        static_cast<unsigned long long>(
+            g_interpolationAbProbe.lastPresentationSerial),
+        kAbProbeWarmupSeconds,
+        static_cast<unsigned long long>(g_interpolationAbProbe.warmupFrames),
+        g_interpolationAbProbe.sampledSeconds,
+        static_cast<unsigned long long>(g_interpolationAbProbe.sampledFrames),
+        averageFrameMilliseconds, averageFps,
+        InterpolationAbPercentile(0.50),
+        InterpolationAbPercentile(0.95),
+        InterpolationAbPercentile(0.99),
+        g_interpolationAbProbe.minimumFrameMilliseconds,
+        g_interpolationAbProbe.maximumFrameMilliseconds,
+        cadenceFps,
+        static_cast<unsigned long long>(g_interpolationAbProbe.zeroTickFrames),
+        static_cast<unsigned long long>(g_interpolationAbProbe.oneTickFrames),
+        static_cast<unsigned long long>(
+            g_interpolationAbProbe.multipleTickFrames),
+        static_cast<unsigned long long>(
+            g_interpolationAbProbe.invalidCadenceFrames),
+        static_cast<unsigned long long>(CounterDelta(
+            current.renderModelHookCalls,
+            g_interpolationAbProbe.countersAtStart.renderModelHookCalls)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.firstPersonRootCorrections,
+            g_interpolationAbProbe.countersAtStart.firstPersonRootCorrections)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.worldCandidates,
+            g_interpolationAbProbe.countersAtStart.worldCandidates)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.worldAdjustments,
+            g_interpolationAbProbe.countersAtStart.worldAdjustments)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.skeletalHookCalls,
+            g_interpolationAbProbe.countersAtStart.skeletalHookCalls)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.skeletalPrepareCalls,
+            g_interpolationAbProbe.countersAtStart.skeletalPrepareCalls)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.skeletalAdjustments,
+            g_interpolationAbProbe.countersAtStart.skeletalAdjustments)),
+        static_cast<unsigned long long>(CounterDelta(
+            current.forcedUploads,
+            g_interpolationAbProbe.countersAtStart.forcedUploads)));
+}
+
+void StartInterpolationAbSegment() {
+    g_interpolationAbProbe = {};
+    if (!QueryPerformanceFrequency(&g_interpolationAbProbe.frequency) ||
+        g_interpolationAbProbe.frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&g_interpolationAbProbe.segmentStartCounter)) {
+        Log("A/B probe could not initialize the performance counter.");
+        return;
+    }
+    g_interpolationAbProbe.capturing = true;
+    g_interpolationAbProbe.transformInterpolationEnabled =
+        RuntimeTransformInterpolationEnabled();
+    g_interpolationAbProbe.skeletalInterpolationEnabled =
+        RuntimeSkeletalInterpolationEnabled();
+    g_interpolationAbProbe.firstPersonHandsEnabled =
+        RuntimeFirstPersonHandsEnabled();
+    g_interpolationAbProbe.segmentId = g_nextInterpolationAbSegmentId++;
+    g_interpolationAbProbe.startPresentationSerial =
+        g_presentationSerial.load(std::memory_order_acquire);
+    g_interpolationAbProbe.lastPresentationSerial =
+        g_interpolationAbProbe.startPresentationSerial;
+    Log("A/B segment %llu started: transforms=%s skeletons=%s hands=%s at "
+        "presentation serial %llu; first %.1f seconds are warm-up.",
+        static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
+        g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
+        static_cast<unsigned long long>(
+            g_interpolationAbProbe.startPresentationSerial),
+        kAbProbeWarmupSeconds);
+    QueryPerformanceCounter(&g_interpolationAbProbe.segmentStartCounter);
+}
+
+void StopInterpolationAbSegment(const char* reason) {
+    ReportInterpolationAbSegment(reason);
+    g_interpolationAbProbe.capturing = false;
+    g_interpolationAbProbe.hasPreviousFrame = false;
+}
+
+void RecordInterpolationAbFrame(const PresentationContext& context) {
+    if (!g_enableInterpolationAbProbe ||
+        !g_interpolationAbProbe.capturing || !context.valid) {
+        return;
+    }
+
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceCounter(&now)) {
+        return;
+    }
+    g_interpolationAbProbe.lastPresentationSerial = context.serial;
+    if (!g_interpolationAbProbe.hasPreviousFrame) {
+        g_interpolationAbProbe.previousFrameCounter = now;
+        g_interpolationAbProbe.previousScaledTime = context.scaledTime;
+        g_interpolationAbProbe.previousSimulationTime = context.simulationTime;
+        g_interpolationAbProbe.hasPreviousFrame = true;
+        return;
+    }
+
+    const double counterFrequency = static_cast<double>(
+        g_interpolationAbProbe.frequency.QuadPart);
+    const double elapsedSeconds = static_cast<double>(
+        now.QuadPart - g_interpolationAbProbe.previousFrameCounter.QuadPart) /
+        counterFrequency;
+    const double sinceSegmentStart = static_cast<double>(
+        now.QuadPart - g_interpolationAbProbe.segmentStartCounter.QuadPart) /
+        counterFrequency;
+    const double scaledDelta =
+        context.scaledTime - g_interpolationAbProbe.previousScaledTime;
+    const double simulationDelta =
+        context.simulationTime - g_interpolationAbProbe.previousSimulationTime;
+    g_interpolationAbProbe.previousFrameCounter = now;
+    g_interpolationAbProbe.previousScaledTime = context.scaledTime;
+    g_interpolationAbProbe.previousSimulationTime = context.simulationTime;
+
+    if (sinceSegmentStart < kAbProbeWarmupSeconds) {
+        ++g_interpolationAbProbe.warmupFrames;
+        return;
+    }
+    if (!g_interpolationAbProbe.samplingStarted) {
+        g_interpolationAbProbe.samplingStarted = true;
+        g_interpolationAbProbe.sampleStartPresentationSerial = context.serial;
+        g_interpolationAbProbe.countersAtStart = CaptureInterpolationAbCounters();
+        return;
+    }
+    if (!(elapsedSeconds > 0.0) || elapsedSeconds > 0.5) {
+        ++g_interpolationAbProbe.invalidCadenceFrames;
+        return;
+    }
+
+    const double frameMilliseconds = elapsedSeconds * 1000.0;
+    ++g_interpolationAbProbe.sampledFrames;
+    g_interpolationAbProbe.sampledSeconds += elapsedSeconds;
+    g_interpolationAbProbe.minimumFrameMilliseconds = std::min(
+        g_interpolationAbProbe.minimumFrameMilliseconds, frameMilliseconds);
+    g_interpolationAbProbe.maximumFrameMilliseconds = std::max(
+        g_interpolationAbProbe.maximumFrameMilliseconds, frameMilliseconds);
+    const std::size_t histogramIndex = std::min<std::size_t>(
+        static_cast<std::size_t>(frameMilliseconds /
+                                 kAbProbeHistogramBinMilliseconds),
+        kAbProbeHistogramBinCount - 1);
+    ++g_interpolationAbProbe.histogram[histogramIndex];
+
+    if (scaledDelta > kTimeEpsilon && scaledDelta <= 0.5 &&
+        simulationDelta >= -kTimeEpsilon && simulationDelta <= 0.5) {
+        const double ticks = std::max(0.0, simulationDelta) /
+                             kNativeSimulationStep;
+        g_interpolationAbProbe.simulationTicks += ticks;
+        ++g_interpolationAbProbe.cadenceFrames;
+        if (ticks < 0.5) {
+            ++g_interpolationAbProbe.zeroTickFrames;
+        } else if (ticks < 1.5) {
+            ++g_interpolationAbProbe.oneTickFrames;
+        } else {
+            ++g_interpolationAbProbe.multipleTickFrames;
+        }
+    } else {
+        ++g_interpolationAbProbe.invalidCadenceFrames;
+    }
+}
+
+void HandleInterpolationAbControls() {
+    const bool f11IsDown = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11IsDown && !g_f11WasDown) {
+        const bool controlIsDown =
+            (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool altIsDown =
+            (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        const bool shiftIsDown =
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (controlIsDown) {
+            if (!g_enableInterpolationAbProbe) {
+                Log("Ctrl+F11: A/B measurement is unavailable because "
+                    "Diagnostics/InterpolationABProbe is disabled.");
+            } else if (g_interpolationAbProbe.capturing) {
+                StopInterpolationAbSegment("Ctrl+F11 stop");
+                Log("Ctrl+F11: A/B measurement stopped; travel frames will "
+                    "not be sampled.");
+            } else {
+                StartInterpolationAbSegment();
+            }
+        } else if (altIsDown) {
+            if (!HasConfiguredInterpolationLayers()) {
+                Log("Alt+F11: no interpolation layers are enabled by "
+                    "configuration.");
+            } else {
+                SuspendAdaptiveInterpolationForManualControl();
+                const bool transformsEnabled =
+                    g_transformInterpolationRuntimeEnabled.load(
+                        std::memory_order_relaxed);
+                const bool skeletonsEnabled =
+                    g_skeletalInterpolationRuntimeEnabled.load(
+                        std::memory_order_relaxed);
+                bool nextTransforms = true;
+                bool nextSkeletons = true;
+                if (transformsEnabled && skeletonsEnabled) {
+                    nextTransforms = true;
+                    nextSkeletons = false;
+                } else if (transformsEnabled) {
+                    nextTransforms = false;
+                    nextSkeletons = true;
+                } else if (skeletonsEnabled) {
+                    nextTransforms = false;
+                    nextSkeletons = false;
+                }
+                const bool wasCapturing = g_interpolationAbProbe.capturing;
+                if (wasCapturing) {
+                    StopInterpolationAbSegment("Alt+F11 profile change");
+                }
+                g_transformInterpolationRuntimeEnabled.store(
+                    nextTransforms, std::memory_order_relaxed);
+                g_skeletalInterpolationRuntimeEnabled.store(
+                    nextSkeletons, std::memory_order_relaxed);
+                Log("Alt+F11: interpolation profile transforms=%s "
+                    "skeletons=%s; first-person root remains unchanged.",
+                    nextTransforms ? "on" : "off",
+                    nextSkeletons ? "on" : "off");
+                if (wasCapturing) {
+                    StartInterpolationAbSegment();
+                }
+            }
+        } else if (shiftIsDown) {
+            if (!g_stabilizeFirstPersonHands) {
+                Log("Shift+F11: first-person root stabilization is disabled "
+                    "by configuration.");
+            } else {
+                const bool nowEnabled =
+                    !g_firstPersonHandsRuntimeEnabled.load(
+                        std::memory_order_relaxed);
+                const bool wasCapturing = g_interpolationAbProbe.capturing;
+                if (wasCapturing) {
+                    StopInterpolationAbSegment("Shift+F11 mode change");
+                }
+                g_firstPersonHandsRuntimeEnabled.store(
+                    nowEnabled, std::memory_order_relaxed);
+                Log("Shift+F11: first-person root stabilization %s; camera "
+                    "prediction remains unchanged.",
+                    nowEnabled ? "enabled" : "disabled");
+                if (wasCapturing) {
+                    StartInterpolationAbSegment();
+                }
+            }
+        } else if (!HasConfiguredInterpolationLayers()) {
+            Log("F11: no interpolation layers are enabled by configuration.");
+        } else {
+            SuspendAdaptiveInterpolationForManualControl();
+            const bool anyEnabled =
+                g_transformInterpolationRuntimeEnabled.load(
+                    std::memory_order_relaxed) ||
+                g_skeletalInterpolationRuntimeEnabled.load(
+                    std::memory_order_relaxed);
+            const bool nowEnabled = !anyEnabled;
+            const bool wasCapturing = g_interpolationAbProbe.capturing;
+            if (wasCapturing) {
+                StopInterpolationAbSegment("F11 mode change");
+            }
+            g_transformInterpolationRuntimeEnabled.store(
+                nowEnabled, std::memory_order_relaxed);
+            g_skeletalInterpolationRuntimeEnabled.store(
+                nowEnabled, std::memory_order_relaxed);
+            Log("F11: configured world/skeletal/cinematic interpolation %s; "
+                "camera, mouse, unlock, and first-person root settings remain "
+                "unchanged.", nowEnabled ? "enabled" : "disabled");
+            if (wasCapturing) {
+                StartInterpolationAbSegment();
+            }
+        }
+    }
+    g_f11WasDown = f11IsDown;
+}
+
 void ResetPrediction(const void* source, double simulationTime, const Transform& transform) {
     g_prediction.initialized = true;
     g_prediction.sourceView = source;
@@ -4088,6 +5103,7 @@ void ApplyPrediction(void* destination, const void* source) {
             nowEnabled ? "enabled" : "disabled");
     }
     g_f10WasDown = f10IsDown;
+    HandleInterpolationAbControls();
     if (!g_enabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -4164,6 +5180,11 @@ extern "C" void* __fastcall HookCopyView(void* destination, const void* source) 
     ApplyPrediction(destination, source);
     PublishRenderCorrection(rawCamera, ReadTransform(destination));
     PublishPresentationContext();
+    PresentationContext probeContext{};
+    if (ReadPresentationContext(probeContext)) {
+        UpdateAdaptiveInterpolationGate(probeContext);
+        RecordInterpolationAbFrame(probeContext);
+    }
     PublishTelemetry(source, destination);
     return result;
 }
@@ -4424,6 +5445,13 @@ bool InstallSkinnedPoseUploadHook() {
 }
 
 bool InstallHook() {
+    ExecutableImageLayout image{};
+    if (!ReadExecutableImageLayout(image) ||
+        !ValidateViewCopyCallRelationship(image)) {
+        Log("Renderer view-copy site changed after preflight; patch not installed.");
+        return false;
+    }
+
     auto* callsite = reinterpret_cast<unsigned char*>(g_executableBase + kCopyCallsiteRva);
     g_originalCopyView = reinterpret_cast<CopyViewFn>(g_executableBase + kCopyViewRva);
     g_relay = AllocateRelayNear(reinterpret_cast<std::uintptr_t>(callsite));
@@ -4473,10 +5501,13 @@ DWORD WINAPI InstallThread(void*) {
         Log("World-transform interpolation self-test failed; hooks were not installed.");
         return 0;
     }
-    if (g_executableBase == 0 || !VerifyExecutable()) {
+    if (g_executableBase == 0) {
         return 0;
     }
     LoadConfiguration();
+    if (!VerifyExecutableLayout()) {
+        return 0;
+    }
     if (g_enableTelemetry) {
         InitializeTelemetry();
     }

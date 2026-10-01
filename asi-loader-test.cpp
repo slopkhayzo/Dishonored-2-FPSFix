@@ -65,7 +65,7 @@ int wmain() {
         pluginLoaded =
             GetModuleHandleW(L"Dishonored2HighFPSFix.asi") != nullptr;
         diagnosticWritten =
-            FileContains(logPath, "SHA-256 does not match");
+            FileContains(logPath, "Host executable is not Dishonored2.exe");
         if (pluginLoaded && diagnosticWritten) {
             break;
         }

@@ -45,6 +45,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if not exist "build\layout-host" mkdir "build\layout-host"
+copy /Y "build\asi-load-test.exe" "build\layout-host\Dishonored2.exe" >nul
+if errorlevel 1 (
+  echo.
+  echo Layout-host test staging failed.
+  exit /b 1
+)
+
 cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
   /Fo:"build\asi-loader-test.obj" ^
   "asi-loader-test.cpp" ^
@@ -78,6 +86,13 @@ if errorlevel 1 (
 if errorlevel 1 (
   echo.
   echo ASI load test failed.
+  exit /b 1
+)
+
+"build\layout-host\Dishonored2.exe" "build\Dishonored2HighFPSFix.asi" --layout-host
+if errorlevel 1 (
+  echo.
+  echo Executable-layout fail-closed test failed.
   exit /b 1
 )
 

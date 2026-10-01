@@ -63,11 +63,21 @@ bool BuildSiblingPath(const wchar_t* modulePath, const wchar_t* filename,
 }  // namespace
 
 int wmain(int argumentCount, wchar_t** arguments) {
-    if (argumentCount != 2) {
+    if (argumentCount != 2 && argumentCount != 3) {
         std::fwprintf(stderr,
-                      L"Usage: asi-load-test.exe <path-to-Dishonored2HighFPSFix.asi>\n");
+                      L"Usage: asi-load-test.exe <path-to-Dishonored2HighFPSFix.asi> "
+                      L"[--layout-host]\n");
         return 2;
     }
+    const bool layoutHost =
+        argumentCount == 3 && wcscmp(arguments[2], L"--layout-host") == 0;
+    if (argumentCount == 3 && !layoutHost) {
+        std::fwprintf(stderr, L"Unknown test option: %ls\n", arguments[2]);
+        return 2;
+    }
+    const char* expectedDiagnostic = layoutHost ?
+        "Executable layout check failed for renderer view-copy call site" :
+        "Host executable is not Dishonored2.exe";
 
     wchar_t logPath[MAX_PATH]{};
     if (!BuildSiblingPath(arguments[1], L"d2-high-fps-fix.log", logPath)) {
@@ -105,7 +115,7 @@ int wmain(int argumentCount, wchar_t** arguments) {
         }
         if (currentLogSize.QuadPart > initialLogSize.QuadPart &&
             AppendedLogContains(logPath, initialLogSize.QuadPart,
-                                "SHA-256 does not match")) {
+                                expectedDiagnostic)) {
             diagnosticWritten = true;
             break;
         }
@@ -120,6 +130,8 @@ int wmain(int argumentCount, wchar_t** arguments) {
 
     // Do not call FreeLibrary: the production plugin is process-lifetime and
     // intentionally has no live-unload/unhook contract.
-    std::wprintf(L"ASI load, no-proxy-export, sibling-log, and fail-closed checks passed.\n");
+    std::wprintf(L"ASI load, no-proxy-export, sibling-log, and %ls fail-closed "
+                 L"checks passed.\n",
+                 layoutHost ? L"layout" : L"host-identity");
     return 0;
 }
